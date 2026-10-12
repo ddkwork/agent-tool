@@ -147,7 +147,9 @@ func formatDecompile(input AnalyzeInput, targets []string, lines []decompileLine
 			}
 		case fatal != nil && fatal.Target == t:
 			fmt.Fprintf(&sb, "// %s: %s error: %s\n", t, fatal.ErrorKind, fatal.Error)
-			sb.WriteString("// " + decompileSuggestion(fatal.ErrorKind, t) + "\n")
+			if s := decompileSuggestion(fatal.ErrorKind, t); s != "" {
+				sb.WriteString("// " + s + "\n")
+			}
 		default:
 			reason := failure
 			if fatal != nil {

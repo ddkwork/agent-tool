@@ -44,19 +44,20 @@ func newXrefLocator(path, pdbPath string, pdbForce bool) *xrefLocator {
 	// A MinGW or Go image names its functions in DWARF, as decompile shows
 	// them; without these xref would call the same function sub_<va>.
 	if cg.format == "PE" && l.pdb == nil {
-		if f, err := pe.Open(path); err == nil {
-			if dd, err := f.DWARF(); err == nil {
-				if l.symbols == nil {
-					l.symbols = map[uint64]string{}
-				}
-				for va, n := range loadDWARFInfo("DWARF", dd, int32(l.ptrSize)).functionNames() {
-					if l.symbols[va] == "" {
-						l.symbols[va] = n
-					}
+		_ = withDebugInfo(path, pdbPath, pdbForce, func(ds debugSource) error {
+			if _, ok := ds.(*dwarfInfo); !ok {
+				return nil
+			}
+			if l.symbols == nil {
+				l.symbols = map[uint64]string{}
+			}
+			for va, n := range ds.functionNames() {
+				if l.symbols[va] == "" {
+					l.symbols[va] = n
 				}
 			}
-			f.Close()
-		}
+			return nil
+		})
 	}
 	l.symVAs = make([]uint64, 0, len(l.symbols))
 	for va := range l.symbols {

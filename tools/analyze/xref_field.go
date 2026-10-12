@@ -284,7 +284,7 @@ func fieldCandidates(path string, bin *xrefBinary, loc *xrefLocator, mode int, o
 		scope = fmt.Sprintf("whole binary decoded; %d method(s) of %s and %d function(s) taking a %s (debug prototypes) decompiled first",
 			methods, strings.Join(owners, ", "), extra, owners[0])
 		if sb, err := loadSearchBinary(path); err == nil && sb.reachable != nil {
-			spec := instructionSearchSpec{findings: "all", displacement: off, hasDisp: true}
+			spec := instructionSearchSpec{findings: "all", displacement: off, hasDisp: true, rvaOnly: true}
 			hits, _, _ := scanInstructions(sb.bin, spec, sb.reachable, sb.interiors, 1<<22)
 			for _, h := range hits {
 				if h.confidence != "confirmed" {

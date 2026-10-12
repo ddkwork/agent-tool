@@ -40,6 +40,10 @@ type instructionSearchSpec struct {
 	hasDisp      bool
 	callTarget   string
 	findings     string
+	// rvaOnly skips formatting each match: a caller that only groups
+	// matches by function (xref field over a one-byte displacement) can get
+	// hundreds of thousands of them.
+	rvaOnly bool
 }
 
 type instructionHit struct {
@@ -341,7 +345,10 @@ func scanInstructions(bin *cgBinary, spec instructionSearchSpec, reachable, inte
 						continue
 					}
 					out.total++
-					hit := instructionHit{rva: rva, text: x86asm.IntelSyntax(inst, bin.imageBase+uint64(rva), nil), confidence: "candidate"}
+					hit := instructionHit{rva: rva, confidence: "candidate"}
+					if !spec.rvaOnly {
+						hit.text = x86asm.IntelSyntax(inst, bin.imageBase+uint64(rva), nil)
+					}
 					if reachable.has(rva) {
 						hit.confidence = "confirmed"
 						if len(out.confirmed) < maxResults {
