@@ -114,7 +114,7 @@ Relative local paths resolve against an explicit workspace, then the client's MC
 - redis: Execute Redis commands (any command, result formatting)
 - sloc: Count source lines of code (SLOC) with per-language summary
 - debug: Interactive debugger via DAP (breakpoints, stepping, variables, stack traces)
-- analyze: Static binary analysis (23 operations: decompile to C (x86/x64 PE/ELF), disassemble, semantic instruction search/value tracing, PE/ELF/Mach-O parsing, imphash, Rich header, resources, DWARF, strings, hexdump, pattern search, entropy, overlay, binary diff, xref, function_at, call_graph, follow_ptr, rtti_dump, struct_layout, vtable_scan)
+- analyze: Static binary analysis (24 operations: decompile to C (x86/x64 PE/ELF), type_info (PDB/DWARF types), disassemble, semantic instruction search/value tracing, PE/ELF/Mach-O parsing, imphash, Rich header, resources, DWARF, strings, hexdump, pattern search, entropy, overlay, binary diff, xref, function_at, call_graph, follow_ptr, rtti_dump, struct_layout, vtable_scan)
 - set_config: Change runtime settings (encoding, file size, SSRF policy, DoH/ECH toggle)
 - agent_tool_help: This help tool
 - toolbox: Describe/call any tool through one stable gateway; optionally manage direct bindings
@@ -533,8 +533,9 @@ Parameters: session_id, operation, adapter_command, adapter_args, address, launc
   max_output_chars, variable_filter, start_module, module_count
 
 ## analyze
-Static binary analysis tool with 23 operations:
-- decompile: Decompile x86/x64 PE/ELF functions to C (Ghidra-equivalent Gosleigh core; va = hex address or symbol, up to 16 comma-separated; timeout_sec; a matching PDB or embedded DWARF supplies names, prototypes, types, globals and locals; Go binaries use Go's ABI; pdb_path to override)
+Static binary analysis tool with 24 operations:
+- decompile: Decompile x86/x64 PE/ELF functions to C (Ghidra-equivalent Gosleigh core; va = hex address or symbol, up to 16 comma-separated; timeout_sec; a matching PDB or embedded DWARF supplies names, prototypes, types, globals and locals, and the structs/enums the C names follow each function; Go binaries use Go's ABI; pdb_path to override)
+- type_info: Print PDB/DWARF struct/class/union/enum definitions by name (type_name): members with offsets, bitfields, base classes, union alternatives, enum values
 - disassemble: x86/x64/ARM/ARM64 disassembly (stop_at_ret for function-scoped)
 - instruction_search: Semantic x86/x64 mnemonic/register/immediate/displacement search with exhaustive executable-offset recovery, CFG confidence, function names, target/result filters, and bounded value tracing to call/tail-call arguments
 - pe_info: PE header parsing with RWX section warnings
@@ -555,12 +556,13 @@ Static binary analysis tool with 23 operations:
 - call_graph: Static call graph from root function (PE/ELF/Mach-O, x86/x64/ARM64/ARM32)
 - follow_ptr: Follow pointer chain with symbol annotation (PE). Detects circular pointer references
 - rtti_dump: Parse MSVC RTTI from vtable (class name + base classes). Includes demangled class names, pSelf cross-validation for x64, and section data caching
-- struct_layout: Dump memory as structured layout with annotations (PE)
+- struct_layout: Lay a debug type over image memory (PE): the PDB/DWARF global at va, or type_name over any va, member by member with values; without a type, pointer-sized slots with symbol annotations. type_info prints a type's definition
 - vtable_scan: Scan PE .rdata for all MSVC vtables with RTTI (auto-discovers C++ classes)
 Parameters: operation, file_path, offset, count, mode, arch (x86/arm),
   base_addr, min_length, max_results, length, section, pattern, mnemonic,
   register, immediate, trace_values, file_path_b, va, target_va,
-  target_end_va, stop_at_ret, result_offset, max_output_chars, timeout_sec, pdb_path
+  target_end_va, stop_at_ret, result_offset, max_output_chars, timeout_sec, pdb_path,
+  type_name
 Use topic='analyze' for detailed guide with examples.
 
 ## set_config
@@ -878,10 +880,13 @@ containing a text, or a structure field (PE, ELF, Mach-O).
   target_text: finds up to 16 stored strings (UTF-8/ASCII and UTF-16LE)
     containing the text, widens each to the whole string, and lists the
     references to each; max_results is shared across them.
-  field: Class::member (Go: pkg.Type::field). The offset comes from the PDB or
-    DWARF, inherited members included. Candidate functions are those with a
-    [reg+offset] operand -- the whole binary for offsets >= 0x80, otherwise the
-    methods of the class and of its bases down to the declaring one. Each
+  field: Class::member (Go: pkg.Type::field); the class as decompile prints it
+    (Rect) or qualified (geo::Rect). The offset comes from the PDB or DWARF,
+    inherited members included. Candidate functions are those with a
+    [reg+offset] operand anywhere in the binary (offsets >= 0x80 by a byte
+    search for the 4-byte displacement; smaller ones, encoded in one byte, by
+    decoding every instruction). The methods of the class and its bases and the
+    functions whose debug prototype takes the class are decompiled first. Each
     candidate is decompiled with the debug types: functions whose C names the
     member are confirmed accesses (with the lines); the rest share only the
     offset. max_results = functions to decompile (default 32, max 128);
@@ -997,12 +1002,21 @@ Parse MSVC RTTI (Run-Time Type Information) from a vtable address.
   Auto-detects x86 vs x64 from PE Machine field.
 
 ### struct_layout
-Dump a memory region as a structured layout with pointer-sized slots.
-  analyze(operation="struct_layout", file_path="/path/to/binary.exe",
-          va="0x140050000", length=128)
+Lay out image memory (PE).
+  analyze(operation="struct_layout", file_path="/path/to/game.exe", va="g_world")
+  analyze(operation="struct_layout", file_path="/path/to/game.exe", va="0x140050000", type_name="Player")
 
-  Each slot is annotated: symbol name, [code]/[data]/[rdata] section, or [null].
-  Useful for inspecting vtables, object layouts, and data structures.
+  With debug types (PDB, or MinGW DWARF): the global variable starting at va, or
+  type_name laid over va, is printed member by member with values -- nested
+  structures as dotted paths, bitfields extracted, enums named, pointers
+  annotated, char arrays as strings, zero-filled aggregates as {0}. Values are
+  the image's initial data (uninitialized .bss reads as zero), not a running
+  process: use memtool for live memory. A va inside a global gets a note naming
+  its start.
+
+  Otherwise pointer-sized slots, each annotated: symbol name,
+  [code]/[data]/[rdata] section, or [null] -- for vtables and untyped data.
+  type_info prints a type's definition without reading memory.
 
   Parameters:
     va: Starting virtual address (hex, required)
@@ -1070,8 +1084,24 @@ Decompile functions to C with the Gosleigh engine (a Go port of Ghidra's decompi
   no-return flags, and call sites followed by padding or another function.
 
   Bitfield members print as fields (p->mode = v; if (p->bReady == 0)) instead of
-  masks and shifts. Type definitions are omitted from the output to save tokens;
-  use struct_layout for a layout.
+  masks and shifts where the engine recognizes them; otherwise the mask stays and
+  the bitfield layout below decodes it.
+
+  After each function come the definitions of the structs, unions and enums its C
+  names -- by type name, or by an enumerator it compares against (MODE_AUTO) --
+  plus the enums those structs' members have: members with offsets (+0x24),
+  bitfield bit ranges, base classes, enum values in hex and decimal. Up to 6000
+  characters and 32 members per type; anything else (a type reached only through
+  a member, like Point in n->pos[0].x) is one call away:
+    analyze(operation="type_info", file_path=..., type_name="Point, geo::Rect")
+
+  va names resolve exactly, then by a scope suffix (Rect::area or area for
+  geo::Rect::area), then ignoring case -- in every address operation
+  (disassemble, function_at, call_graph, xref target_va, follow_ptr,
+  struct_layout, hexdump), which also accept globals, imports and name+0x10. A name several functions share
+  (overloads) is an error listing each with its address; an unknown name lists
+  similar ones. Output past max_output_chars ends with the result_offset that
+  continues it (the worker keeps the binary loaded, so paging is cheap).
 
   An address inside a function is moved to its start when x64 .pdata gives exact
   extents; otherwise the output carries a note -- confirm the start with function_at.
@@ -1087,6 +1117,25 @@ Decompile functions to C with the Gosleigh engine (a Go port of Ghidra's decompi
     pdb_force: Load pdb_path even if its GUID does not match (warns)
     timeout_sec: Worker time limit (default 60, max 600)
     max_output_chars: Output cap (default 32768)
+    result_offset: Character offset to continue a truncated output
+
+### type_info
+Print debug-type definitions by name, from a PE's PDB (or its embedded DWARF)
+or an ELF's DWARF -- the types decompile names but did not print.
+  analyze(operation="type_info", file_path="/path/to/game.exe", type_name="Player, EState")
+
+  Structs/classes/unions list every member with its offset (+0x10 int w_;),
+  bitfield bit ranges, base classes (super_Base) and the union alternatives a
+  decompiled layout cannot hold (marked); enums list each value in hex and
+  decimal. Names match qualified (geo::Rect), as decompile prints them (Rect),
+  or ignoring case; a short name shared by several namespaces prints each, and
+  an unknown one lists similar names. C typedef'd tagless structs/enums
+  (typedef struct {...} Obj) are found by the typedef name.
+
+  Parameters:
+    type_name: Up to 16 names, comma-separated (required)
+    pdb_path / pdb_force: As for decompile
+    max_output_chars / result_offset: Output cap and continuation
 
 ## Typical Workflow
 
@@ -1100,6 +1149,7 @@ Decompile functions to C with the Gosleigh engine (a Go port of Ghidra's decompi
 8. hexdump -- Examine specific data regions at file offsets
 9. disassemble -- Decode machine code (use va= for PE virtual addresses)
    decompile -- Read a function as C once its start is known (x86/x64 PE/ELF)
+   type_info -- Members/offsets/enum values of a debug type decompile names
 10. instruction_search -- Find decoded instructions/constants and trace bounded values into call arguments
 11. function_at -- Find function boundaries (.pdata or heuristic fallback)
 12. xref -- References to an address, a string text or a struct field, each named by its function (PE/ELF/Mach-O)

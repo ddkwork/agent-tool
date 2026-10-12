@@ -67,6 +67,7 @@ type decompileLine struct {
 	Name      string   `json:"name,omitempty"`
 	Note      string   `json:"note,omitempty"`
 	C         string   `json:"c,omitempty"`
+	Types     string   `json:"types,omitempty"` // definitions of the debug types C names
 	Warnings  []string `json:"warnings,omitempty"`
 	ErrorKind string   `json:"error_kind,omitempty"` // input, load, engine, panic, memory
 	Error     string   `json:"error,omitempty"`
@@ -219,15 +220,17 @@ func (t *decompileTarget) decompile(target string, maxInstr int, ghidraFormat bo
 	line.C, line.Warnings = res.C, res.Warnings
 	if !ghidraFormat {
 		line.C = stripTypeDefinitions(line.C)
+		if t.host.debug != nil {
+			line.Types = typeSection(t.host.debug, line.C)
+		}
 	}
 	return line
 }
 
 // stripTypeDefinitions drops the one-line struct/union/enum definitions the
 // core prints ahead of a function. With PDB types they cover every class
-// reachable from the parameters -- often dozens of large C++ types --
-// which costs an agent far more tokens than it helps; field names already
-// appear in the code, and struct_layout shows a layout on demand.
+// reachable from the parameters -- often dozens of large C++ types -- and
+// carry no member offsets; typeSection prints the types the C names instead.
 func stripTypeDefinitions(c string) string {
 	lines := strings.Split(c, "\n")
 	i := 0
@@ -283,10 +286,20 @@ func (t *decompileTarget) hostLocals(entry uint64) (map[int64]string, map[int64]
 func (t *decompileTarget) resolve(target string) (uint64, string, error) {
 	va, err := parseHexAddr(target)
 	if err != nil {
-		if e, ok := t.host.lookupName(target); ok {
-			return e, "", nil
+		matches, similar := t.host.lookupName(target)
+		switch {
+		case len(matches) == 1:
+			return matches[0], "", nil
+		case len(matches) > 1:
+			return 0, "", fmt.Errorf("%q names %d functions (overloads or several classes); pass one address: %s", target, len(matches), t.host.describe(matches, 12))
 		}
-		return 0, "", fmt.Errorf("%q is neither a hex address nor a function name in this file (names come from PE exports, the matching PDB, DWARF and ELF symbol tables; use the qualified form, e.g. Class::Method or main.main); pass va as hex, e.g. 0x140001000", target)
+		msg := fmt.Sprintf("%q is neither a hex address nor a function name in this file (names come from PE exports, the matching PDB, DWARF and ELF symbol tables)", target)
+		if len(similar) > 0 {
+			msg += "; similar: " + t.host.describe(similar, 12)
+		} else {
+			msg += "; pass va as hex, e.g. 0x140001000"
+		}
+		return 0, "", errors.New(msg)
 	}
 	if !t.inExec(va) {
 		return 0, "", fmt.Errorf("0x%x is not inside an executable section; check the address with analyze pe_info/elf_info", va)
@@ -603,18 +616,70 @@ func (h *decompHost) QueryExternalRef(a address.Address) (string, bool) {
 	return n, ok
 }
 
-func (h *decompHost) lookupName(name string) (uint64, bool) {
-	var fold uint64
-	found := false
-	for va, n := range h.funcs {
-		if n == name || n != "" && ghidraName(n) == name {
-			return va, true
+// lookupName finds the functions name stands for, in order of preference:
+// the exact (or display) name, a qualified name ending in it at a scope
+// boundary (Rect::area for geo::Rect::area, area alone), then the same
+// ignoring case. Several matches at the first tier that has any are all
+// returned -- overloads share a name and picking one silently decompiles
+// the wrong function. With no match, similar holds names containing it.
+func (h *decompHost) lookupName(name string) (matches, similar []uint64) {
+	name = strings.TrimSpace(name)
+	lower := strings.ToLower(name)
+	suffix := func(n, s string) bool {
+		return strings.HasSuffix(n, "::"+s) || strings.HasSuffix(n, "."+s)
+	}
+	var tiers [4][]uint64
+	var near []uint64
+	defer func() {
+		if len(matches) == 0 && len(similar) == 0 {
+			similar = near // a typo: TakeDamge for TakeDamage
 		}
-		if !found && n != "" && strings.EqualFold(n, name) {
-			fold, found = va, true
+	}()
+	for _, va := range h.starts {
+		n := h.funcs[va]
+		if n == "" {
+			continue
+		}
+		g := ghidraName(n)
+		nl, gl := strings.ToLower(n), strings.ToLower(g)
+		switch {
+		case n == name || g == name:
+			tiers[0] = append(tiers[0], va)
+		case suffix(n, name) || suffix(g, name):
+			tiers[1] = append(tiers[1], va)
+		case nl == lower || gl == lower:
+			tiers[2] = append(tiers[2], va)
+		case suffix(nl, lower) || suffix(gl, lower):
+			tiers[3] = append(tiers[3], va)
+		default:
+			if len(lower) >= 3 && strings.Contains(gl, lower) && len(similar) < 12 {
+				similar = append(similar, va)
+			} else if len(near) < 12 && len(lower) >= 4 {
+				if _, short := splitQualified(gl); nearName(short, lower[strings.LastIndex(lower, ":")+1:]) {
+					near = append(near, va)
+				}
+			}
 		}
 	}
-	return fold, found
+	for _, t := range tiers {
+		if len(t) > 0 {
+			return t, nil
+		}
+	}
+	return nil, similar
+}
+
+// describe lists functions as "name @ 0xaddr", at most n of them.
+func (h *decompHost) describe(vas []uint64, n int) string {
+	parts := make([]string, 0, min(len(vas), n)+1)
+	for i, va := range vas {
+		if i == n {
+			parts = append(parts, fmt.Sprintf("... %d more", len(vas)-n))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s @ 0x%x", h.nameOf(va), va))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (h *decompHost) precedingStart(va uint64) (uint64, bool) {

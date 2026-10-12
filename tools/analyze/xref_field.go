@@ -7,6 +7,7 @@ import (
 	"debug/elf"
 	"debug/pe"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -36,10 +37,12 @@ func opXrefField(ctx context.Context, input AnalyzeInput) (string, error) {
 		return "", fmt.Errorf("field must be Class::member (e.g. Player::health), got %q", input.Field)
 	}
 	class, member := input.Field[:i], input.Field[i+2:]
-	off, source, owners, err := resolveFieldOffset(input.FilePath, input.PDBPath, input.PDBForce, class, member)
+	ft, err := resolveFieldOffset(input.FilePath, input.PDBPath, input.PDBForce, class, member)
 	if err != nil {
 		return "", err
 	}
+	off, source, owners := ft.off, ft.source, ft.owners
+	field := owners[0] + "::" + member
 	bin, err := xrefOpen(input.FilePath)
 	if err != nil {
 		return "", err
@@ -63,13 +66,13 @@ func opXrefField(ctx context.Context, input AnalyzeInput) (string, error) {
 	if loc == nil {
 		return "", fmt.Errorf("cannot build the function table of %s", input.FilePath)
 	}
-	cands, scope := fieldCandidates(bin, loc, mode, off, owners)
+	cands, scope := fieldCandidates(input.FilePath, bin, loc, mode, off, owners, ft.takers)
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Field %s: offset 0x%x (%s)\n", input.Field, off, source)
+	fmt.Fprintf(&sb, "Field %s: offset 0x%x (%s)\n", field, off, source)
 	fmt.Fprintf(&sb, "Candidates: %d function(s) with a [reg+0x%x] operand (%s).\n", len(cands), off, scope)
 	if len(cands) == 0 {
-		sb.WriteString("No instruction addresses that offset. The field may be reached through a pointer to a sub-object, an inlined copy, or code xref cannot decode.\n")
+		sb.WriteString("No instruction addresses that offset. The field may be reached through a pointer to a sub-object (base+index addressing), an inlined copy, or code xref cannot decode.\n")
 		return sb.String(), nil
 	}
 	todo := cands
@@ -140,7 +143,11 @@ func opXrefField(ctx context.Context, input AnalyzeInput) (string, error) {
 		if failure != "" {
 			fmt.Fprintf(&sb, " (%s)", failure)
 		}
-		fmt.Fprintf(&sb, "; raise max_results (functions, max %d) or timeout_sec.\n", maxXrefFieldFuncs)
+		fmt.Fprintf(&sb, "; raise max_results (functions, max %d) or timeout_sec.", maxXrefFieldFuncs)
+		if len(cands) > len(todo) {
+			sb.WriteString(" Candidates are ordered methods and functions taking the class first, then by matching instructions: the tail mostly uses another type at the same offset.")
+		}
+		sb.WriteString("\n")
 		for _, c := range notDone {
 			fmt.Fprintf(&sb, "  %s @ 0x%x: %s\n", c.name, c.start, c.first)
 		}
@@ -148,16 +155,31 @@ func opXrefField(ctx context.Context, input AnalyzeInput) (string, error) {
 	return sb.String(), nil
 }
 
+// fieldTarget is a resolved Class::member: its offset, the debug source,
+// the owning classes (the qualified class first, then the bases passed
+// through to the declaring one) and the functions whose prototype takes the
+// class (this pointer, parameter, pointer or reference).
+type fieldTarget struct {
+	off    int64
+	source string
+	owners []string
+	takers []uint64
+}
+
 type fieldCandidate struct {
 	start  uint64
 	name   string
 	first  string // first matching instruction, "0x...: asm"
 	hits   int
-	method bool
+	method bool // a method of the class or a function taking it: decompiled first
 }
 
 // fieldCandidates groups the instructions addressing [reg+off] by function.
-func fieldCandidates(bin *xrefBinary, loc *xrefLocator, mode int, off int64, owners []string) ([]fieldCandidate, string) {
+func fieldCandidates(path string, bin *xrefBinary, loc *xrefLocator, mode int, off int64, owners []string, takers []uint64) ([]fieldCandidate, string) {
+	taker := make(map[uint64]bool, len(takers))
+	for _, va := range takers {
+		taker[va] = true
+	}
 	isMethod := func(name string) bool {
 		for _, o := range owners {
 			if isMethodOf(name, o) {
@@ -178,7 +200,7 @@ func fieldCandidates(bin *xrefBinary, loc *xrefLocator, mode int, off int64, own
 			if k := strings.LastIndex(base, "+0x"); k > 0 {
 				base = base[:k]
 			}
-			c = &fieldCandidate{start: start, name: base, method: isMethod(base)}
+			c = &fieldCandidate{start: start, name: base, method: isMethod(base) || taker[start]}
 			c.first = fmt.Sprintf("0x%x: %s", va, xrefAsm(inst, va))
 			byFunc[start] = c
 		}
@@ -210,11 +232,35 @@ func fieldCandidates(bin *xrefBinary, loc *xrefLocator, mode int, off int64, own
 		}
 		scope = "whole binary searched"
 	} else {
-		// disp8 (and 0): scan the class's own methods only.
+		// disp8 (and 0): one byte, in nearly every function, so a byte
+		// search finds nothing useful. The functions that hold the class --
+		// its methods and, from the debug prototypes, the functions taking
+		// it (use_node(Node *n) has no method name to find it by) -- are
+		// walked by their exact bounds and decompiled first; then every
+		// instruction of the binary is decoded (instruction_search's cached
+		// sweep), so code holding the pointer only in a local is a
+		// candidate too.
+		scan := map[uint64]bool{}
+		methods := 0
 		for _, va := range loc.symVAs {
-			if !isMethod(loc.symbols[va]) {
-				continue
+			if isMethod(loc.symbols[va]) && !scan[va] {
+				scan[va] = true
+				methods++
 			}
+		}
+		extra := 0
+		for _, va := range takers {
+			if !scan[va] {
+				scan[va] = true
+				extra++
+			}
+		}
+		vas := make([]uint64, 0, len(scan))
+		for va := range scan {
+			vas = append(vas, va)
+		}
+		sort.Slice(vas, func(i, j int) bool { return vas[i] < vas[j] })
+		for _, va := range vas {
 			if name, start := loc.function(va); name == "" || start != va {
 				continue
 			}
@@ -235,7 +281,29 @@ func fieldCandidates(bin *xrefBinary, loc *xrefLocator, mode int, off int64, own
 				cur += inst.Len
 			}
 		}
-		scope = fmt.Sprintf("offset below 0x80: only the methods of %s scanned, a disp8 operand is too common to search the whole binary", strings.Join(owners, ", "))
+		scope = fmt.Sprintf("whole binary decoded; %d method(s) of %s and %d function(s) taking a %s (debug prototypes) decompiled first",
+			methods, strings.Join(owners, ", "), extra, owners[0])
+		if sb, err := loadSearchBinary(path); err == nil && sb.reachable != nil {
+			spec := instructionSearchSpec{findings: "all", displacement: off, hasDisp: true}
+			hits, _, _ := scanInstructions(sb.bin, spec, sb.reachable, sb.interiors, 1<<22)
+			for _, h := range hits {
+				if h.confidence != "confirmed" {
+					continue // undecoded bytes: possibly data
+				}
+				va := sb.bin.imageBase + uint64(h.rva)
+				if name, start := loc.function(va); name == "" || scan[start] {
+					continue // already walked
+				}
+				if data, at, ok := bin.codeAt(va); ok {
+					if inst, err := x86asm.Decode(data[at:], mode); err == nil && addressesField(inst, off, mode) {
+						note(va, inst)
+					}
+				}
+			}
+		} else {
+			scope = fmt.Sprintf("only %d method(s) of %s and %d function(s) taking a %s scanned (the whole-binary decode failed: %v)",
+				methods, strings.Join(owners, ", "), extra, owners[0], err)
+		}
 	}
 	out := make([]fieldCandidate, 0, len(byFunc))
 	for _, c := range byFunc {
@@ -298,47 +366,144 @@ func (l *xrefLocator) functionEnd(va uint64, avail int) int {
 // resolveFieldOffset finds member in class through the PE's PDB or the
 // binary's DWARF, searching base-class sub-objects too.
 // owners are the class and the bases down to the one declaring the member.
-func resolveFieldOffset(path, pdbPath string, pdbForce bool, class, member string) (int64, string, []string, error) {
+func resolveFieldOffset(path, pdbPath string, pdbForce bool, class, member string) (fieldTarget, error) {
 	if f, err := pe.Open(path); err == nil {
 		defer f.Close()
 		if pdbPath == "none" {
-			return 0, "", nil, fmt.Errorf("field xref needs the PDB's types; pdb_path=none disables it")
+			return fieldTarget{}, fmt.Errorf("field xref needs the PDB's types; pdb_path=none disables it")
 		}
 		_, is64 := f.OptionalHeader.(*pe.OptionalHeader64)
 		pi, note := openPDBInfo(path, pdbPath, pdbForce, f, peImageBase(f), is64)
 		if pi == nil {
+			// MinGW and Go images carry DWARF instead of a PDB.
+			if dd, err := f.DWARF(); err == nil {
+				ps := int32(4)
+				if is64 {
+					ps = 8
+				}
+				return dwarfFieldTarget(dd, ps, class, member)
+			}
 			if note == "" {
 				note = "no matching PDB found beside the image"
 			}
-			return 0, "", nil, fmt.Errorf("field xref needs debug types: %s. Pass pdb_path, or use xref with target_va on a global", note)
+			return fieldTarget{}, fmt.Errorf("field xref needs debug types: %s. Pass pdb_path, or use xref with target_va on a global", note)
 		}
-		ti, ok := pi.types.tt.ByName(class)
-		if !ok {
-			return 0, "", nil, fmt.Errorf("no class/struct named %q in %s (use the qualified name, e.g. ns::Class)", class, pi.path)
+		var d *pcode.HostTypeDesc
+		if ti, ok := pi.types.tt.ByName(class); ok {
+			d = pi.types.desc(ti)
+		} else {
+			// decompile prints a type without its namespaces (Rect for
+			// geo::Rect): accept that form when it names one type.
+			x := pi.typeIndex()
+			qs := x.find(class, true)
+			switch {
+			case len(qs) == 1:
+				class = qs[0]
+				d = pi.typeDesc(x.refs[class].ref)
+			case len(qs) > 1:
+				return fieldTarget{}, fmt.Errorf("%q names %d types; pass a qualified one: %s", class, len(qs), strings.Join(qs[:min(len(qs), typeInfoMaxMatches)], ", "))
+			default:
+				msg := fmt.Sprintf("no class/struct named %q in %s", class, pi.path)
+				if sim := x.similar(class, 10); len(sim) > 0 {
+					msg += "; similar: " + strings.Join(sim, ", ")
+				}
+				return fieldTarget{}, errors.New(msg)
+			}
 		}
-		d := pi.types.desc(ti)
 		if d == nil {
-			return 0, "", nil, fmt.Errorf("%s has no usable layout in the PDB", class)
+			return fieldTarget{}, fmt.Errorf("%s has no usable layout in the PDB", class)
 		}
-		if off, owners, ok := findHostMember(d, member, 0, 0); ok {
-			return off, "PDB " + pi.path, append([]string{class}, owners...), nil
+		off, owners, ok := findHostMember(d, member, 0, 0)
+		if !ok {
+			return fieldTarget{}, fmt.Errorf("%s has no member %q; members: %s", class, member, memberNames(d))
 		}
-		return 0, "", nil, fmt.Errorf("%s has no member %q; members: %s", class, member, memberNames(d))
+		var takers []uint64
+		for va, fn := range pi.funcs {
+			if fn.proc != nil && pi.types.takes(fn.proc, class) {
+				takers = append(takers, va)
+			}
+		}
+		return fieldTarget{off, "PDB " + pi.path, append([]string{class}, owners...), takers}, nil
 	}
 	f, err := elf.Open(path)
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("field xref needs a PE with its PDB or an ELF with DWARF")
+		return fieldTarget{}, fmt.Errorf("field xref needs a PE with its PDB or an ELF with DWARF")
 	}
 	defer f.Close()
 	dd, err := f.DWARF()
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("no DWARF in %s; field xref needs debug types", path)
+		return fieldTarget{}, fmt.Errorf("no DWARF in %s; field xref needs debug types", path)
 	}
+	ps := int32(4)
+	if f.Class == elf.ELFCLASS64 {
+		ps = 8
+	}
+	return dwarfFieldTarget(dd, ps, class, member)
+}
+
+// dwarfFieldTarget resolves class::member in DWARF: a tagged structure
+// (base classes followed), else a typedef naming a tagless one.
+func dwarfFieldTarget(dd *dwarf.Data, ps int32, class, member string) (fieldTarget, error) {
+	di := loadDWARFInfo("DWARF", dd, ps)
+	short := class[strings.LastIndex(class, ":")+1:]
 	off, err := dwarfMemberOffset(dd, class, member)
 	if err != nil {
-		return 0, "", nil, err
+		x := di.typeIndex()
+		qs := x.find(class, false)
+		if len(qs) != 1 {
+			return fieldTarget{}, err
+		}
+		d := di.typeDesc(x.refs[qs[0]].ref)
+		o, _, ok := findHostMember(d, member, 0, 0)
+		if !ok {
+			if d != nil {
+				return fieldTarget{}, fmt.Errorf("%s has no member %q; members: %s", class, member, memberNames(d))
+			}
+			return fieldTarget{}, err
+		}
+		off = o
 	}
-	return off, "DWARF", []string{class}, nil
+	return fieldTarget{off, "DWARF", []string{class}, di.functionsTaking(short)}, nil
+}
+
+// functionsTaking lists the functions with a parameter that is the named
+// structure or a pointer to it (one level, through qualifiers and typedefs).
+func (di *dwarfInfo) functionsTaking(short string) []uint64 {
+	var out []uint64
+	for va, fn := range di.funcs {
+		for _, p := range fn.params {
+			if dwarfUDTName(p.typ) == short {
+				out = append(out, va)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func dwarfUDTName(t dwarf.Type) string {
+	pointer := false
+	for t != nil {
+		switch v := t.(type) {
+		case *dwarf.QualType:
+			t = v.Type
+		case *dwarf.TypedefType:
+			if isAnonDWARF(v.Type) {
+				return v.Name // typedef struct { ... } Name
+			}
+			t = v.Type
+		case *dwarf.PtrType:
+			if pointer {
+				return ""
+			}
+			pointer, t = true, v.Type
+		case *dwarf.StructType:
+			return v.StructName
+		default:
+			return ""
+		}
+	}
+	return ""
 }
 
 // findHostMember finds member in d or, through "super_" base-class fields,

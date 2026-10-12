@@ -183,14 +183,27 @@ func TestFindXrefStrings(t *testing.T) {
 // base class, and the method that touches it is confirmed by decompiling.
 func TestXrefFieldFixture(t *testing.T) {
 	exe := filepath.Join("testdata", "pdb", "fixture_x64.exe")
-	off, _, owners, err := resolveFieldOffset(exe, "", false, "geo::Rect", "id_")
+	ft, err := resolveFieldOffset(exe, "", false, "geo::Rect", "id_")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(owners) < 2 || owners[0] != "geo::Rect" {
-		t.Errorf("id_ at 0x%x owners %v: want the base class after geo::Rect", off, owners)
+	if len(ft.owners) < 2 || ft.owners[0] != "geo::Rect" {
+		t.Errorf("id_ at 0x%x owners %v: want the base class after geo::Rect", ft.off, ft.owners)
 	}
-	out, err := opXref(context.Background(), AnalyzeInput{FilePath: exe, Field: "geo::Rect::w_"})
+	// The class as decompile prints it, without its namespace.
+	if short, err := resolveFieldOffset(exe, "", false, "Rect", "w_"); err != nil || short.owners[0] != "geo::Rect" {
+		t.Errorf("short class name: %+v, %v", short, err)
+	}
+	// A small offset in a free function taking Node *: found through the
+	// PDB prototype, not a method name.
+	out, err := opXref(context.Background(), AnalyzeInput{FilePath: exe, Field: "Node::flags"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "use_node") || !strings.Contains(out, "n->flags") {
+		t.Errorf("Node::flags xref misses use_node:\n%s", out)
+	}
+	out, err = opXref(context.Background(), AnalyzeInput{FilePath: exe, Field: "geo::Rect::w_"})
 	if err != nil {
 		t.Fatal(err)
 	}

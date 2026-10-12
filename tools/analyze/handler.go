@@ -20,13 +20,13 @@ const (
 
 // AnalyzeInput defines parameters for the static binary analysis tool.
 type AnalyzeInput struct {
-	Operation string `json:"operation" jsonschema:"Operation: disassemble, instruction_search, pe_info, elf_info, macho_info, strings, hexdump, pattern_search, entropy, bin_diff, resource_info, imphash, rich_header, overlay_detect, dwarf_info, xref, function_at, call_graph, follow_ptr, rtti_dump, struct_layout, vtable_scan, decompile,required"`
+	Operation string `json:"operation" jsonschema:"Operation: disassemble, instruction_search, pe_info, elf_info, macho_info, strings, hexdump, pattern_search, entropy, bin_diff, resource_info, imphash, rich_header, overlay_detect, dwarf_info, xref, function_at, call_graph, follow_ptr, rtti_dump, struct_layout, vtable_scan, decompile, type_info,required"`
 	FilePath  string `json:"file_path,omitempty" jsonschema:"Binary file path. Relative paths use workspace/MCP root,required"`
 	Path      string `json:"path,omitempty" jsonschema:"Alias for file_path"`
 
 	// disassemble / function_at / follow_ptr parameters
 	Offset    int         `json:"offset,omitempty" jsonschema:"Byte offset to start from. Default: 0"`
-	VA        string      `json:"va,omitempty" jsonschema:"Virtual address for PE files (hex, e.g. '0x140001000'). Auto-converts to file offset. For disassemble, function_at, follow_ptr, rtti_dump, struct_layout. Preferred over offset+base_addr for PE analysis. For decompile: function entry as hex VA or symbol name, up to 16 comma-separated."`
+	VA        string      `json:"va,omitempty" jsonschema:"Virtual address: hex (0x140001000) or a symbol name (export, import, PDB/DWARF function or global; name+0x10 adds an offset). For disassemble, function_at, call_graph, follow_ptr, rtti_dump, struct_layout, hexdump. Preferred over offset+base_addr. For decompile: function entries, up to 16 comma-separated."`
 	Count     int         `json:"count,omitempty" jsonschema:"Number of instructions (disassemble) or depth (follow_ptr). Default: 50/4, Max: 1000/10. For a large function, raise count or set stop_at_ret=true; if output hits the cap it prints a truncation note with a resume va to continue from."`
 	StopAtRet interface{} `json:"stop_at_ret,omitempty" jsonschema:"Stop disassembly at function return (RET/RETF). Confirms boundary via INT3/NOP padding or new prologue. For disassemble only: true or false. Default: false"`
 	Mode      int         `json:"mode,omitempty" jsonschema:"CPU mode: 32 or 64. Default: 64"`
@@ -44,7 +44,7 @@ type AnalyzeInput struct {
 	// pe_info / elf_info / macho_info parameters
 	Section        string `json:"section,omitempty" jsonschema:"Filter by section name (e.g. '.text', '.rdata'). Empty = show all"`
 	RVA            string `json:"rva,omitempty" jsonschema:"RVA to convert to file offset (hex string, e.g. '0x36A20'). For pe_info only"`
-	ResultOffset   int    `json:"result_offset,omitempty" jsonschema:"Zero-based import result offset for pe_info paging. Default: 0"`
+	ResultOffset   int    `json:"result_offset,omitempty" jsonschema:"Paging offset: import index for pe_info; character offset for decompile and type_info (a truncated output names the value that continues it). Default: 0"`
 	MaxOutputChars int    `json:"max_output_chars,omitempty" jsonschema:"Maximum returned text characters for paged analysis output. Default: 32768, Max: 131072"`
 
 	// pattern_search parameters
@@ -61,10 +61,13 @@ type AnalyzeInput struct {
 	Findings     string `json:"findings,omitempty" jsonschema:"Result kind: all (default), call (CALL/tail-call value arguments only), or producer (direct instructions and value producers only). For instruction_search"`
 
 	// xref parameters
-	TargetVA    string `json:"target_va,omitempty" jsonschema:"Target virtual address to find references to, or inclusive range start when target_end_va is set (hex). For xref operation."`
+	TargetVA    string `json:"target_va,omitempty" jsonschema:"Target address to find references to (hex or a symbol name), or inclusive range start when target_end_va is set. For xref operation."`
 	TargetEndVA string `json:"target_end_va,omitempty" jsonschema:"Optional inclusive end of the target address range (hex). Omit for an exact-address xref."`
 	TargetText  string `json:"target_text,omitempty" jsonschema:"xref: find the stored strings containing this text (UTF-8 and UTF-16LE), then the references to each. Instead of target_va"`
-	Field       string `json:"field,omitempty" jsonschema:"xref: structure field as Class::member (offset from the PDB or DWARF); lists the functions that access it, confirmed by decompiling candidates. Instead of target_va"`
+	Field       string `json:"field,omitempty" jsonschema:"xref: structure field as Class::member (offset from the PDB or DWARF; the class as decompile prints it or qualified); lists the functions that access it, confirmed by decompiling candidates. Instead of target_va"`
+
+	// type_info parameters
+	TypeName string `json:"type_name,omitempty" jsonschema:"type_info: struct/class/union/enum name as decompile prints it (Node) or qualified (geo::Rect), up to 16 comma-separated; prints members with offsets and enum values from the PDB or DWARF. struct_layout: one type to lay over va (default: the global at va)"`
 
 	// bin_diff parameters
 	FilePathB string `json:"file_path_b,omitempty" jsonschema:"Second file for bin_diff. Relative paths use workspace/MCP root"`
@@ -108,12 +111,13 @@ var validOperations = map[string]bool{
 	"struct_layout":      true,
 	"vtable_scan":        true,
 	"decompile":          true,
+	"type_info":          true,
 }
 
 // Handle dispatches to the appropriate operation.
 func Handle(ctx context.Context, req *mcp.CallToolRequest, input AnalyzeInput) (*mcp.CallToolResult, AnalyzeOutput, error) {
 	op := strings.ToLower(strings.TrimSpace(input.Operation))
-	allOps := "disassemble, instruction_search, pe_info, elf_info, macho_info, strings, hexdump, pattern_search, entropy, bin_diff, resource_info, imphash, rich_header, overlay_detect, dwarf_info, xref, function_at, call_graph, follow_ptr, rtti_dump, struct_layout, vtable_scan, decompile"
+	allOps := "disassemble, instruction_search, pe_info, elf_info, macho_info, strings, hexdump, pattern_search, entropy, bin_diff, resource_info, imphash, rich_header, overlay_detect, dwarf_info, xref, function_at, call_graph, follow_ptr, rtti_dump, struct_layout, vtable_scan, decompile, type_info"
 	if op == "" {
 		return errorResult("operation is required (" + allOps + ")")
 	}
@@ -183,6 +187,12 @@ func Handle(ctx context.Context, req *mcp.CallToolRequest, input AnalyzeInput) (
 	// their own per-operation size checks. This allows analyzing multi-GB
 	// binaries with debug symbols (common for game servers).
 
+	if vaOperations[op] {
+		if err := resolveSymbolArgs(&input); err != nil {
+			return errorResult(err.Error())
+		}
+	}
+
 	var result string
 	switch op {
 	case "disassemble":
@@ -231,6 +241,8 @@ func Handle(ctx context.Context, req *mcp.CallToolRequest, input AnalyzeInput) (
 		result, err = opVtableScan(input)
 	case "decompile":
 		result, err = opDecompile(ctx, input)
+	case "type_info":
+		result, err = opTypeInfo(input)
 	}
 
 	if err != nil {
@@ -246,7 +258,7 @@ func Handle(ctx context.Context, req *mcp.CallToolRequest, input AnalyzeInput) (
 func Register(server *mcp.Server) {
 	common.SafeAddTool(server, &mcp.Tool{
 		Name:        "analyze",
-		Description: `Static PE/ELF/Mach-O analysis: disassembly, semantic instruction search, headers, strings, hex/pattern search, entropy/diff, xrefs, functions/call graphs, pointers, RTTI, layouts, vtables, and decompilation to C (x86/x64 PE/ELF; va = hex address or symbol, comma-separated for several; a matching PDB or embedded DWARF is applied automatically). Use instruction_search for mnemonic/register/value queries and pattern_search for encoded bytes. Prefer va for PE addresses. Use debug for runtime inspection.`,
+		Description: `Static PE/ELF/Mach-O analysis: disassembly, semantic instruction search, headers, strings, hex/pattern search, entropy/diff, xrefs, functions/call graphs, pointers, RTTI, layouts, vtables, and decompilation to C (x86/x64 PE/ELF; va = hex address or symbol, comma-separated for several; a matching PDB or embedded DWARF is applied automatically, and the structs/enums the C names are printed after it), type_info for any other debug type (members with offsets, enum values). Use instruction_search for mnemonic/register/value queries and pattern_search for encoded bytes. Prefer va for PE addresses. Use debug for runtime inspection.`,
 	}, Handle)
 }
 

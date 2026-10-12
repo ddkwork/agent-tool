@@ -18,6 +18,14 @@ type debugSource interface {
 	// variables to their names and types (nil when none).
 	locals(va uint64, fb frameBase) map[int64]stackVar
 	noReturn() []uint64
+	// typeIndex names the source's structures, unions and enums (built on
+	// first use); typeDesc describes one, overlapsOf lists the members its
+	// layout left out.
+	typeIndex() *typeIndex
+	typeDesc(ref uint64) *pcode.HostTypeDesc
+	overlapsOf(d *pcode.HostTypeDesc) []pcode.HostFieldDesc
+	// globalDesc is the global variable containing va, typed.
+	globalDesc(va uint64) (name string, start uint64, d *pcode.HostTypeDesc, ok bool)
 }
 
 func (pi *pdbInfo) kind() string { return "PDB" }

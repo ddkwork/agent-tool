@@ -153,40 +153,10 @@ func (c *pdbTypes) namedDesc(name string) *pcode.HostTypeDesc {
 	}
 	if c.byNorm == nil {
 		c.byNorm = map[string]pdb.TypeIndex{}
-		for i := 0; i < c.tt.Len(); i++ {
-			ti := c.tt.Begin + pdb.TypeIndex(i)
-			l, _, _ := c.tt.Raw(ti)
-			switch l {
-			case pdb.LFClass, pdb.LFStructure, pdb.LFInterface, pdb.LFUnion, pdb.LFEnum,
-				pdb.LFClass2, pdb.LFStructure2, pdb.LFUnion2, pdb.LFInterface2:
-			default:
-				continue
-			}
-			typ, err := c.tt.Lookup(ti)
-			if err != nil {
-				continue
-			}
-			var n string
-			switch v := typ.(type) {
-			case *pdb.Class:
-				if v.FwdRef() {
-					continue
-				}
-				n = v.Name
-			case *pdb.Union:
-				if v.FwdRef() {
-					continue
-				}
-				n = v.Name
-			case *pdb.Enum:
-				if v.FwdRef() {
-					continue
-				}
-				n = v.Name
-			}
-			if k := normTypeName(n); k != "" {
+		for _, def := range c.tt.Definitions() {
+			if k := normTypeName(def.Name); k != "" {
 				if _, dup := c.byNorm[k]; !dup {
-					c.byNorm[k] = ti
+					c.byNorm[k] = def.Index
 				}
 			}
 		}

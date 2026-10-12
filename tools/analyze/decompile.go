@@ -110,7 +110,7 @@ func formatDecompile(input AnalyzeInput, targets []string, lines []decompileLine
 	}
 	sb.WriteString(".\n")
 	if load.PDB != "" {
-		fmt.Fprintf(&sb, "Debug info: %s (function names, prototypes, struct/enum types, global data and named locals applied).\n", load.PDB)
+		fmt.Fprintf(&sb, "Debug info: %s (function names, prototypes, struct/enum types, global data and named locals applied). The structs/enums each function names follow it with member offsets and enum values; analyze type_info type_name=<T> prints any other.\n", load.PDB)
 		if load.PDBNote != "" {
 			fmt.Fprintf(&sb, "WARNING: PDB %s.\n", load.PDBNote)
 		}
@@ -137,9 +137,14 @@ func formatDecompile(input AnalyzeInput, targets []string, lines []decompileLine
 			if !strings.HasSuffix(r.C, "\n") {
 				sb.WriteString("\n")
 			}
+			if r.Types != "" {
+				fmt.Fprintf(&sb, "// types named above (from %s):\n%s", load.PDB, r.Types)
+			}
 		case have:
 			fmt.Fprintf(&sb, "// %s: %s error: %s\n", t, r.ErrorKind, r.Error)
-			sb.WriteString("// " + decompileSuggestion(r.ErrorKind, t) + "\n")
+			if s := decompileSuggestion(r.ErrorKind, t); s != "" {
+				sb.WriteString("// " + s + "\n")
+			}
 		case fatal != nil && fatal.Target == t:
 			fmt.Fprintf(&sb, "// %s: %s error: %s\n", t, fatal.ErrorKind, fatal.Error)
 			sb.WriteString("// " + decompileSuggestion(fatal.ErrorKind, t) + "\n")
@@ -156,16 +161,18 @@ func formatDecompile(input AnalyzeInput, targets []string, lines []decompileLine
 		}
 	}
 
-	out := sb.String()
-	if max := input.MaxOutputChars; max > 0 && len([]rune(out)) > max {
-		out = string([]rune(out)[:max]) + fmt.Sprintf("\n... [truncated at %d chars; decompile fewer functions per call or raise max_output_chars]\n", max)
-	}
-	return out
+	// The worker keeps the binary loaded, so continuing with result_offset
+	// re-decompiles in well under a second: a function larger than the
+	// output cap can still be read whole.
+	return pageOutput(sb.String(), input.ResultOffset, input.MaxOutputChars, "decompile")
 }
 
 func decompileSuggestion(kind, target string) string {
 	switch kind {
 	case "input":
+		if _, err := parseHexAddr(target); err != nil {
+			return "" // a name: the error lists the candidates
+		}
 		return "Try: analyze function_at va=" + target + " to find the function start, or pe_info/elf_info for symbols"
 	case "memory", "timeout":
 		return "Try: decompile it alone with a larger timeout_sec, or analyze disassemble va=" + target + " stop_at_ret=true"

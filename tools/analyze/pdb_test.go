@@ -64,9 +64,10 @@ func TestDecompilePDBPrototypes(t *testing.T) {
 				t.Errorf("%s: output lacks %q:\n%s", arch, want, out)
 			}
 		}
-		// Type definitions are left out of the agent-facing output.
-		if strings.Contains(out, "struct Node {") {
-			t.Errorf("%s: type definitions not stripped:\n%s", arch, out)
+		// The core's own one-line definitions (the whole reachable closure,
+		// no offsets) are replaced by the type section.
+		if strings.Contains(out, "struct Node { Node") {
+			t.Errorf("%s: core type definitions not stripped:\n%s", arch, out)
 		}
 		if arch == "x86" && !strings.Contains(out, "__fastcall fast_call(int a, int b, int c)") {
 			t.Errorf("x86: fast_call convention lost:\n%s", out)

@@ -22,6 +22,10 @@ type dwarfInfo struct {
 	done    map[dwarf.Type]bool
 	types   map[dwarf.Type]pcode.Datatype
 	anon    int
+	// overlaps are the members a structure's layout left out (see
+	// keepDisjoint), kept for type_info.
+	overlaps map[*pcode.HostTypeDesc][]pcode.HostFieldDesc
+	index    *typeIndex
 	// goStackResults: Go 386 code (ABI0) returns results in stack slots
 	// after the arguments, which the golang spec's model has no output for.
 	goStackResults bool
@@ -69,7 +73,8 @@ const (
 // directly to the decompiler's entry-relative stack space.
 func loadDWARFInfo(src string, d *dwarf.Data, ptrSize int32) *dwarfInfo {
 	di := &dwarfInfo{src: src, d: d, ptrSize: ptrSize, funcs: map[uint64]*dwarfFunc{},
-		descs: map[dwarf.Type]*pcode.HostTypeDesc{}, done: map[dwarf.Type]bool{}, types: map[dwarf.Type]pcode.Datatype{}}
+		descs: map[dwarf.Type]*pcode.HostTypeDesc{}, done: map[dwarf.Type]bool{}, types: map[dwarf.Type]pcode.Datatype{},
+		overlaps: map[*pcode.HostTypeDesc][]pcode.HostFieldDesc{}}
 	r := d.Reader()
 	type scope struct {
 		name string
@@ -397,6 +402,13 @@ func (di *dwarfInfo) build(t dwarf.Type) *pcode.HostTypeDesc {
 		if under == nil || v.Name == "" {
 			return under
 		}
+		// typedef struct { ... } Foo: the structure has no name of its own,
+		// so it takes the typedef's instead of a meaningless anon_N counter
+		// (which type_info could not look up either). Renamed in place: the
+		// tagless structure is only reachable through this typedef.
+		if under.Name != "" && isAnonDWARF(v.Type) {
+			under.Name = ghidraName(v.Name)
+		}
 		switch under.Meta {
 		case "struct", "union", "array", "code":
 			// A copy carrying the typedef name could be resolved before the
@@ -473,7 +485,11 @@ func (di *dwarfInfo) build(t dwarf.Type) *pcode.HostTypeDesc {
 				}
 				return fields[i].BitOffset < fields[j].BitOffset
 			})
-			fields = keepDisjoint(fields, int64(size), func(d *pcode.HostTypeDesc) int32 { return d.Size })
+			var dropped []pcode.HostFieldDesc
+			fields, dropped = keepDisjoint(fields, int64(size), func(d *pcode.HostTypeDesc) int32 { return d.Size })
+			if len(dropped) > 0 {
+				di.overlaps[d] = dropped
+			}
 		}
 		d.Fields = fields
 		return d
@@ -501,6 +517,23 @@ func (di *dwarfInfo) build(t dwarf.Type) *pcode.HostTypeDesc {
 		return &pcode.HostTypeDesc{Meta: "code", Size: 1, Name: "_func_" + strings.Join(parts, "_"), Proto: cp}
 	}
 	return nil
+}
+
+// isAnonDWARF reports a structure, union or enumeration without a tag name
+// (qualifiers looked through).
+func isAnonDWARF(t dwarf.Type) bool {
+	for {
+		switch v := t.(type) {
+		case *dwarf.QualType:
+			t = v.Type
+		case *dwarf.StructType:
+			return v.StructName == ""
+		case *dwarf.EnumType:
+			return v.EnumName == ""
+		default:
+			return false
+		}
+	}
 }
 
 func (di *dwarfInfo) typeName(n string) string {

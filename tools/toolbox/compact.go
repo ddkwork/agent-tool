@@ -56,11 +56,12 @@ var compactOperationShapes = map[string]map[string]operationShape{
 		"bin_diff":       {fields: []string{"operation", "file_path", "file_path_b", "max_results"}, required: []string{"operation", "file_path", "file_path_b"}},
 		"xref":           {fields: []string{"operation", "file_path", "target_va", "target_end_va", "target_text", "field", "max_results", "timeout_sec", "pdb_path", "pdb_force"}, required: []string{"operation", "file_path"}},
 		"function_at":    {fields: []string{"operation", "file_path", "va", "count", "pdb_path", "pdb_force"}, required: []string{"operation", "file_path", "va"}},
-		"decompile":      {fields: []string{"operation", "file_path", "va", "timeout_sec", "pdb_path", "pdb_force", "max_output_chars"}, required: []string{"operation", "file_path", "va"}},
+		"decompile":      {fields: []string{"operation", "file_path", "va", "timeout_sec", "pdb_path", "pdb_force", "max_output_chars", "result_offset"}, required: []string{"operation", "file_path", "va"}},
+		"type_info":      {fields: []string{"operation", "file_path", "type_name", "pdb_path", "pdb_force", "max_output_chars", "result_offset"}, required: []string{"operation", "file_path", "type_name"}},
 		"call_graph":     {fields: []string{"operation", "file_path", "va", "count", "max_results"}, required: []string{"operation", "file_path", "va"}},
 		"follow_ptr":     {fields: []string{"operation", "file_path", "va", "count", "pdb_path", "pdb_force"}, required: []string{"operation", "file_path", "va"}},
 		"rtti_dump":      {fields: []string{"operation", "file_path", "va"}, required: []string{"operation", "file_path", "va"}},
-		"struct_layout":  {fields: []string{"operation", "file_path", "va", "length", "pdb_path", "pdb_force"}, required: []string{"operation", "file_path", "va"}},
+		"struct_layout":  {fields: []string{"operation", "file_path", "va", "type_name", "length", "pdb_path", "pdb_force"}, required: []string{"operation", "file_path", "va"}},
 	},
 	"copy": {
 		"copy": {

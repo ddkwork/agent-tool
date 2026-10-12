@@ -21,6 +21,10 @@ type pdbTypes struct {
 	done    map[pdb.TypeIndex]bool // descs[ti] computed (may be nil)
 	types   map[pdb.TypeIndex]pcode.Datatype
 	byNorm  map[string]pdb.TypeIndex // normalized UDT name -> definition, built on first use
+	// overlaps are the members a structure's layout left out (see
+	// keepDisjoint), kept for type_info.
+	overlaps map[*pcode.HostTypeDesc][]pcode.HostFieldDesc
+	index    *typeIndex
 }
 
 func newPDBTypes(tt, ids *pdb.TypeTable, is64 bool) *pdbTypes {
@@ -30,7 +34,7 @@ func newPDBTypes(tt, ids *pdb.TypeTable, is64 bool) *pdbTypes {
 	}
 	return &pdbTypes{tt: tt, ids: ids, ptrSize: ps, is64: is64,
 		descs: map[pdb.TypeIndex]*pcode.HostTypeDesc{}, done: map[pdb.TypeIndex]bool{},
-		types: map[pdb.TypeIndex]pcode.Datatype{}}
+		types: map[pdb.TypeIndex]pcode.Datatype{}, overlaps: map[*pcode.HostTypeDesc][]pcode.HostFieldDesc{}}
 }
 
 // simpleNames are the names Ghidra gives the C built-in types, which is how
@@ -135,7 +139,11 @@ func (c *pdbTypes) build(ti pdb.TypeIndex) *pcode.HostTypeDesc {
 		d := &pcode.HostTypeDesc{Meta: "struct", Name: typeName(t.Name), Size: int32(t.Size), ID: typeID(t.Name, t.UniqueName)}
 		// Registered before the members: a member may point back here.
 		c.descs[ti] = d
-		d.Fields = c.structFields(t.FieldList, int64(t.Size))
+		var dropped []pcode.HostFieldDesc
+		d.Fields, dropped = c.structFields(t.FieldList, int64(t.Size))
+		if len(dropped) > 0 {
+			c.overlaps[d] = dropped
+		}
 		return d
 	case *pdb.Union:
 		def := c.tt.Resolve(ti)
@@ -196,7 +204,7 @@ func (c *pdbTypes) build(ti pdb.TypeIndex) *pcode.HostTypeDesc {
 // overlap fields, so a member that overlaps the previous one (an anonymous
 // union's alternatives) is left out. Bitfields share their storage unit's
 // offset and are kept while their bit ranges stay disjoint.
-func (c *pdbTypes) structFields(fl pdb.TypeIndex, size int64) []pcode.HostFieldDesc {
+func (c *pdbTypes) structFields(fl pdb.TypeIndex, size int64) (kept, dropped []pcode.HostFieldDesc) {
 	fields, _ := c.tt.Fields(fl)
 	var out []pcode.HostFieldDesc
 	for _, f := range fields {
@@ -393,33 +401,8 @@ func (c *pdbTypes) datatype(ti pdb.TypeIndex) pcode.Datatype {
 // names (from its parameter records), return type and no-return flag. The
 // core assigns the storage. nil when a type is not expressible.
 func (c *pdbTypes) prototype(p *pdb.Procedure) *pcode.HostFunction {
-	ti := p.Type
-	if p.TypeIsID() && c.ids != nil {
-		id, err := c.ids.Lookup(ti)
-		if err != nil {
-			return nil
-		}
-		switch v := id.(type) {
-		case *pdb.FuncID:
-			ti = v.Type
-		case *pdb.MFuncID:
-			ti = v.Type
-		default:
-			return nil
-		}
-	}
-	typ, err := c.tt.Lookup(ti)
-	if err != nil {
-		return nil
-	}
-	var ret, this, args pdb.TypeIndex
-	var cc pdb.CallConv
-	switch t := typ.(type) {
-	case *pdb.ProcedureType:
-		ret, args, cc = t.Return, t.ArgList, t.CallConv
-	case *pdb.MemberFunction:
-		ret, this, args, cc = t.Return, t.This, t.ArgList, t.CallConv
-	default:
+	ret, this, args, cc, ok := c.signature(p)
+	if !ok {
 		return nil
 	}
 	list, dots := c.argList(args)
@@ -468,6 +451,84 @@ func (c *pdbTypes) prototype(p *pdb.Procedure) *pcode.HostFunction {
 		hf.OutputLocked = false
 	}
 	return hf
+}
+
+// signature is a procedure's function type: return, this pointer (0 for
+// none), argument list and calling convention.
+func (c *pdbTypes) signature(p *pdb.Procedure) (ret, this, args pdb.TypeIndex, cc pdb.CallConv, ok bool) {
+	ti := p.Type
+	if p.TypeIsID() && c.ids != nil {
+		id, err := c.ids.Lookup(ti)
+		if err != nil {
+			return
+		}
+		switch v := id.(type) {
+		case *pdb.FuncID:
+			ti = v.Type
+		case *pdb.MFuncID:
+			ti = v.Type
+		default:
+			return
+		}
+	}
+	typ, err := c.tt.Lookup(ti)
+	if err != nil {
+		return
+	}
+	switch t := typ.(type) {
+	case *pdb.ProcedureType:
+		return t.Return, 0, t.ArgList, t.CallConv, true
+	case *pdb.MemberFunction:
+		return t.Return, t.This, t.ArgList, t.CallConv, true
+	}
+	return
+}
+
+// takes reports whether the procedure's this pointer or a parameter is the
+// named structure, or a pointer or reference to it.
+func (c *pdbTypes) takes(p *pdb.Procedure, class string) bool {
+	_, this, args, _, ok := c.signature(p)
+	if !ok {
+		return false
+	}
+	list, _ := c.argList(args)
+	if this != 0 && c.udtName(this) == class {
+		return true
+	}
+	for _, a := range list {
+		if c.udtName(a) == class {
+			return true
+		}
+	}
+	return false
+}
+
+// udtName is the qualified name of the structure ti is, or points or refers
+// to (one level, through modifiers); "" for anything else.
+func (c *pdbTypes) udtName(ti pdb.TypeIndex) string {
+	pointer := false
+	for !pdb.IsSimple(ti) {
+		typ, err := c.tt.Lookup(ti)
+		if err != nil {
+			return ""
+		}
+		switch t := typ.(type) {
+		case *pdb.Modifier:
+			ti = t.Type
+		case *pdb.Pointer:
+			if pointer {
+				return ""
+			}
+			pointer, ti = true, t.Referent
+		case *pdb.Class:
+			return t.Name
+		case *pdb.Union:
+			return t.Name
+		default:
+			return ""
+		}
+	}
+	return ""
 }
 
 // pdbParamNames applies PDB parameter names. Ghidra's analysis does not, so
@@ -537,13 +598,16 @@ func (c *pdbTypes) paramCount(ti pdb.TypeIndex) int {
 
 // keepDisjoint drops members (sorted by offset, then bit) that overlap an
 // earlier one or run past the structure, comparing bit ranges so that the
-// bitfields of one storage unit sit side by side.
-func keepDisjoint(fields []pcode.HostFieldDesc, size int64, sizeOf func(*pcode.HostTypeDesc) int32) []pcode.HostFieldDesc {
-	kept := fields[:0]
+// bitfields of one storage unit sit side by side. The dropped members are
+// returned too: the decompiler cannot use them, but a reader of the type
+// needs to know an anonymous union's other alternatives exist.
+func keepDisjoint(fields []pcode.HostFieldDesc, size int64, sizeOf func(*pcode.HostTypeDesc) int32) (kept, dropped []pcode.HostFieldDesc) {
+	kept = fields[:0]
 	end := int64(0) // in bits
 	for _, f := range fields {
 		unit := int64(sizeOf(f.Type))
 		if unit <= 0 || int64(f.Offset)+unit > size {
+			dropped = append(dropped, f)
 			continue
 		}
 		lo, hi := int64(f.Offset)*8, (int64(f.Offset)+unit)*8
@@ -551,14 +615,16 @@ func keepDisjoint(fields []pcode.HostFieldDesc, size int64, sizeOf func(*pcode.H
 			lo += int64(f.BitOffset)
 			hi = lo + int64(f.BitSize)
 			if hi > (int64(f.Offset)+unit)*8 {
+				dropped = append(dropped, f)
 				continue
 			}
 		}
 		if lo < end {
+			dropped = append(dropped, f)
 			continue
 		}
 		kept = append(kept, f)
 		end = hi
 	}
-	return kept
+	return kept, dropped
 }
