@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/knewstimek/gosleigh/pkg/pcode"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -219,6 +220,23 @@ func TestTypeTokens(t *testing.T) {
 	want := []string{"int", "Node", "n", "TArray<FString,0>", "TArray", "FString", "a", "main.Point", "main", "p", "s", "x.Value", "x", "Shape"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("typeTokens =\n %q\nwant\n %q", got, want)
+	}
+}
+
+// A structure larger than the section's member cap shows the members the
+// function uses, not its first ones.
+func TestRenderTypeNarrowsToUsed(t *testing.T) {
+	intT := &pcode.HostTypeDesc{Name: "int", Meta: "int", Size: 4}
+	d := &pcode.HostTypeDesc{Name: "Big", Meta: "struct", Size: 400}
+	for i := 0; i < 100; i++ {
+		d.Fields = append(d.Fields, pcode.HostFieldDesc{Name: fmt.Sprintf("m%d", i), Offset: int32(4 * i), Type: intT})
+	}
+	out := renderType("Big", false, d, nil, 32, map[string]bool{"m77": true})
+	if !strings.Contains(out, "+0x134 int m77;") || strings.Contains(out, "m0;") || !strings.Contains(out, "1 of 100 members") {
+		t.Errorf("narrowed render:\n%s", out)
+	}
+	if out := renderType("Big", false, d, nil, 32, nil); !strings.Contains(out, "m0;") || !strings.Contains(out, "68 more members") {
+		t.Errorf("type_info render:\n%s", out)
 	}
 }
 

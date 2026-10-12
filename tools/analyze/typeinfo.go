@@ -6,6 +6,7 @@ import (
 	"debug/pe"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -388,7 +389,11 @@ func enumValue(v uint64, d *pcode.HostTypeDesc) string {
 // member's offset (what a reverse engineer matches against [reg+off]),
 // enums with their values. Members a layout had to leave out (an anonymous
 // union's alternatives) are listed and marked.
-func renderType(qual string, alias bool, d *pcode.HostTypeDesc, overlaps []pcode.HostFieldDesc, maxMembers int) string {
+//
+// used (the member names a function's C accesses) narrows a structure
+// with more than maxMembers members to those: a 0x1150-byte class cut at
+// its first members would hide the one the code reads.
+func renderType(qual string, alias bool, d *pcode.HostTypeDesc, overlaps []pcode.HostFieldDesc, maxMembers int, used map[string]bool) string {
 	var sb strings.Builder
 	label := typeName(qual)
 	where := ""
@@ -436,6 +441,18 @@ func renderType(qual string, alias bool, d *pcode.HostTypeDesc, overlaps []pcode
 			}
 			return ms[i].f.BitOffset < ms[j].f.BitOffset
 		})
+		if len(ms) > maxMembers && len(used) > 0 {
+			var sel []member
+			for _, m := range ms {
+				if used[m.f.Name] {
+					sel = append(sel, m)
+				}
+			}
+			if len(sel) > 0 {
+				fmt.Fprintf(&sb, "    // %d of %d members: the ones this function uses (analyze type_info type_name=%s lists all)\n", len(sel), len(ms), label)
+				ms = sel
+			}
+		}
 		for i, m := range ms {
 			if i == maxMembers {
 				fmt.Fprintf(&sb, "    // ... %d more members: analyze type_info type_name=%s\n", len(ms)-i, label)
@@ -453,7 +470,7 @@ func renderType(qual string, alias bool, d *pcode.HostTypeDesc, overlaps []pcode
 				sb.WriteString(" // base class")
 			}
 			if m.overlap {
-				sb.WriteString(" // overlaps an earlier member (union alternative); decompiled code names the earlier one")
+				sb.WriteString(" // overlaps an earlier member (union alternative, or a base placed in another's padding); decompiled code names the earlier one")
 			}
 			sb.WriteString("\n")
 		}
@@ -472,6 +489,10 @@ func typeSection(ds debugSource, c string) string {
 	seen := map[string]bool{}
 	var sb strings.Builder
 	var over, fieldEnums []string
+	used := map[string]bool{}
+	for _, m := range memberAccess.FindAllStringSubmatch(c, -1) {
+		used[m[1]] = true
+	}
 	show := func(q string) {
 		if seen[q] {
 			return
@@ -482,13 +503,17 @@ func typeSection(ds debugSource, c string) string {
 		if !isUDT(d) {
 			return
 		}
-		s := renderType(q, ref.alias, d, ds.overlapsOf(d), typeSectionMembers)
+		s := renderType(q, ref.alias, d, ds.overlapsOf(d), typeSectionMembers, used)
 		if sb.Len()+len(s) > typeSectionBudget {
 			over = append(over, typeName(q))
 			return
 		}
 		sb.WriteString(s)
+		narrowed := len(d.Fields) > typeSectionMembers
 		for _, f := range d.Fields {
+			if narrowed && !used[f.Name] {
+				continue // a member renderType left out: its enum is noise
+			}
 			if f.Type != nil && (f.Type.Meta == "enum_int" || f.Type.Meta == "enum_uint") {
 				if qs := x.find(f.Type.Name, false); len(qs) == 1 {
 					fieldEnums = append(fieldEnums, qs[0])
@@ -515,6 +540,9 @@ func typeSection(ds debugSource, c string) string {
 	}
 	return sb.String()
 }
+
+// memberAccess matches a member access (p->m, s.m) and captures the member.
+var memberAccess = regexp.MustCompile(`(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]*)`)
 
 // typeTokens returns the identifiers of c that can name a type, in order of
 // first appearance: not a member after -> or ., not a called function, not
@@ -757,7 +785,7 @@ func typeInfoInto(sb *strings.Builder, ds debugSource, names []string) {
 		for _, q := range qs {
 			ref := x.refs[q]
 			d := ds.typeDesc(ref.ref)
-			sb.WriteString(renderType(q, ref.alias, d, ds.overlapsOf(d), typeInfoMembers))
+			sb.WriteString(renderType(q, ref.alias, d, ds.overlapsOf(d), typeInfoMembers, nil))
 		}
 	}
 }
